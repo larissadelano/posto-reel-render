@@ -1,0 +1,26 @@
+{
+  "name": "posto-reel-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "POSTÔ · serviço de render de Reel (motor + Playwright + ffmpeg)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@fontsource/anton": "^5.2.7",
+    "@fontsource/cormorant-garamond": "^5.2.11",
+    "@fontsource/dm-mono": "^5.2.7",
+    "@fontsource/dm-sans": "^5.2.8",
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/karla": "^5.2.8",
+    "@fontsource/lato": "^5.2.7",
+    "@fontsource/quicksand": "^5.2.10",
+    "@fontsource/space-grotesk": "^5.2.10",
+    "express": "^4.22.2",
+    "playwright": "^1.56.0"
+  }
+}
