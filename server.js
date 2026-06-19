@@ -1,21 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════
-// POSTÔ · SERVIÇO DE RENDER DE REEL — v1
-// Um endpoint que o n8n chama por cliente. Recebe o conteúdo + estilo +
-// cores + fotos do cliente, monta o HTML (motor_reel), renderiza frame a
-// frame com Playwright e devolve o .mp4 (1080×1920). As fontes dos 11
-// estilos vêm empacotadas no container.
+// POSTÔ · SERVIÇO DE RENDER — v1.1
+// Dois endpoints que o n8n chama:
+//   POST /render  → recebe conteúdo + estilo + cores + fotos, renderiza
+//                   frame a frame (Playwright) e devolve o .mp4 1080×1920.
+//   POST /pdf     → recebe o HTML da Edição e devolve o PDF (page.pdf).
+// As fontes dos 11 estilos vêm empacotadas no container.
 //
-// POST /render   header: x-api-token: <RENDER_TOKEN>
-//   body JSON:
-//   {
-//     "tela":  { "kicker","hook","hookHi","beats":[{"texto","hi"}],"cta","ctaHi" },
-//     "media": ["https://.../foto1","https://.../foto2", ...],
-//     "C":     { "bg","text","accent","tFont","bFont","escuro" },   // cores do cliente (Ag2)
-//     "estiloSlug": "bold",         // 1 dos 11
-//     "handle": "isley.pilates",
-//     "fps": 30                      // opcional (default 30)
-//   }
-//   resposta: video/mp4 (binário). Com ?format=base64 → JSON {ok,mp4_base64,...}
+// /render  header: x-api-token: <RENDER_TOKEN>
+//   body JSON: { tela, media:[...], C, estiloSlug, handle, fps }
+//   resposta: video/mp4 (binário). ?format=base64 → JSON {ok,mp4_base64,...}
+//
+// /pdf     header: x-api-token: <RENDER_TOKEN>
+//   body JSON: { html:"<!DOCTYPE html>...", format:"A4" (opcional) }
+//   resposta: application/pdf (binário). ?format=base64 → JSON {ok,pdf_base64}
 //
 // GET /health → { ok:true }
 // ═══════════════════════════════════════════════════════════════════
@@ -34,7 +31,7 @@ const MAX_FRAMES = 1400;          // trava de segurança (~46s a 30fps)
 const CHROME = process.env.CHROME_PATH || undefined; // a imagem do Playwright resolve sozinho
 
 const app = express();
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: '8mb' }));
 
 let browser = null;
 async function getBrowser(){
@@ -110,6 +107,52 @@ app.post('/render', async (req, res) => {
     res.status(500).json({ ok:false, error: String(err && err.message || err) });
   } finally {
     if (work) { try { fs.rmSync(work, { recursive:true, force:true }); } catch(e){} }
+  }
+});
+
+// ─── PDF da Edição ───────────────────────────────────────────────────
+// Recebe o HTML da página (Montar Edição) e devolve o PDF. Usa o mesmo
+// Chromium do Playwright (emula print, então as regras @media print da
+// página são aplicadas: botões de copiar somem, layout abre para o papel).
+app.post('/pdf', async (req, res) => {
+  if (TOKEN && req.get('x-api-token') !== TOKEN) return res.status(401).json({ ok:false, error:'token inválido' });
+
+  const body = req.body || {};
+  const html = String(body.html || '');
+  const url  = String(body.url || '');
+  const format = body.format || 'A4';
+  if (!html && !url) return res.status(400).json({ ok:false, error:'envie html ou url' });
+
+  let page = null;
+  try {
+    const b = await getBrowser();
+    page = await b.newPage();
+    if (url){
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+    } else {
+      await page.setContent(html, { waitUntil: 'networkidle' });
+    }
+    await page.waitForTimeout(400);
+
+    const pdf = await page.pdf({
+      printBackground: true,
+      format: format,
+      preferCSSPageSize: false,
+      margin: { top: '0mm', bottom: '0mm', left: '0mm', right: '0mm' }
+    });
+    await page.close(); page = null;
+
+    if (req.query.format === 'base64'){
+      res.json({ ok:true, pdf_base64: Buffer.from(pdf).toString('base64') });
+    } else {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'inline; filename="edicao.pdf"');
+      res.send(pdf);
+    }
+  } catch (err){
+    res.status(500).json({ ok:false, error: String(err && err.message || err) });
+  } finally {
+    if (page) { try { await page.close(); } catch(e){} }
   }
 });
 
