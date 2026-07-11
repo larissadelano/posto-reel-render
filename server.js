@@ -129,23 +129,27 @@ app.post('/render', async (req, res) => {
 // ─── REEL DE VÍDEOS DO CLIENTE (v2) ──────────────────────────────────
 // Clipes → plano determinístico → segmentos normalizados 1080×1920 →
 // overlays na marca do cliente → .mp4 mudo, H.264 yuv420p faststart.
-app.post('/render-video-reel', async (req, res) => {
-  if (TOKEN && req.get('x-api-token') !== TOKEN) return res.status(401).json({ ok:false, error:'token inválido' });
+// ─── Reel de VÍDEO do cliente (Motor v2) ─────────────────────────────
+// O proxy do Render/Cloudflare corta requisições em ~100s, e este render
+// leva mais que isso. Por isso existe o modo assíncrono (padrão job):
+//   POST /render-video-reel?mode=async      → { ok, job_id }  (responde na hora)
+//   GET  /render-video-reel/status/:id      → { status: processing|done|error }
+//   GET  /render-video-reel/result/:id      → o .mp4 (e limpa o job)
+// O modo síncrono original continua existindo para clipes curtos.
 
-  const body = req.body || {};
+const RV_JOBS = new Map(); // job_id → { status, error, file, work, duration, avisos, criado }
+
+async function executarReelVideo(body){
   const roteiro = body.roteiro || {};
   const C = body.C || {};
   const estiloSlug = body.estiloSlug || 'sereno';
   const handle = body.handle || '';
+  const brutos = Array.isArray(body.clipes) ? body.clipes.slice(0, MAX_CLIPES) : [];
+  if (!brutos.length) throw new Error('envie clipes (urls dos vídeos do cliente)');
+  if (!String(roteiro.hook||'').trim()) throw new Error('roteiro sem hook');
 
-  let work = '';
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'reelv2-'));
   try {
-    const brutos = Array.isArray(body.clipes) ? body.clipes.slice(0, MAX_CLIPES) : [];
-    if (!brutos.length) return res.status(400).json({ ok:false, error:'envie clipes (urls dos vídeos do cliente)' });
-    if (!String(roteiro.hook||'').trim()) return res.status(400).json({ ok:false, error:'roteiro sem hook' });
-
-    work = fs.mkdtempSync(path.join(os.tmpdir(), 'reelv2-'));
-
     // 1) baixa os clipes para o disco (um a um, streaming)
     const clipes = [];
     for (let i = 0; i < brutos.length; i++){
@@ -160,7 +164,7 @@ app.post('/render-video-reel', async (req, res) => {
         console.log('clipe ignorado:', String(e.message||e));   // degradação graciosa
       }
     }
-    if (!clipes.length) return res.status(400).json({ ok:false, error:'nenhum clipe pôde ser baixado' });
+    if (!clipes.length) throw new Error('nenhum clipe pôde ser baixado');
 
     // 2) motor (usa o browser persistente do serviço para os overlays)
     const b = await getBrowser();
@@ -171,21 +175,64 @@ app.post('/render-video-reel', async (req, res) => {
       out, browser: b, workDir: work,
       log: m => { avisosLog.push(m); console.log('[video-reel]', m); },
     });
+    return { out, work, duration: r.plan.total, segmentos: r.plan.segmentos.length, avisos: r.plan._porque.avisos };
+  } catch (err){
+    try { fs.rmSync(work, { recursive:true, force:true }); } catch(e){}
+    throw err;
+  }
+}
 
-    const mp4 = fs.readFileSync(out);
+app.post('/render-video-reel', async (req, res) => {
+  if (TOKEN && req.get('x-api-token') !== TOKEN) return res.status(401).json({ ok:false, error:'token inválido' });
+  const body = req.body || {};
+
+  // ── modo assíncrono: responde o ticket na hora, renderiza em segundo plano ──
+  if (req.query.mode === 'async'){
+    const job_id = 'rv-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    RV_JOBS.set(job_id, { status:'processing', criado: Date.now() });
+    executarReelVideo(body)
+      .then(r => RV_JOBS.set(job_id, { status:'done', file:r.out, work:r.work, duration:r.duration, avisos:r.avisos, criado: Date.now() }))
+      .catch(e => RV_JOBS.set(job_id, { status:'error', error:String(e && e.message || e), criado: Date.now() }));
+    return res.json({ ok:true, job_id });
+  }
+
+  // ── modo síncrono (comportamento original; use só para clipes curtos) ──
+  try {
+    const r = await executarReelVideo(body);
+    const mp4 = fs.readFileSync(r.out);
+    try { fs.rmSync(r.work, { recursive:true, force:true }); } catch(e){}
     if (req.query.format === 'base64'){
-      res.json({ ok:true, duration: r.plan.total, segmentos: r.plan.segmentos.length,
-                 avisos: r.plan._porque.avisos, mp4_base64: mp4.toString('base64') });
+      res.json({ ok:true, duration:r.duration, segmentos:r.segmentos, avisos:r.avisos, mp4_base64: mp4.toString('base64') });
     } else {
       res.setHeader('Content-Type', 'video/mp4');
       res.setHeader('Content-Disposition', 'inline; filename="reel_video.mp4"');
       res.send(mp4);
     }
   } catch (err){
-    res.status(500).json({ ok:false, error: String(err && err.message || err) });
-  } finally {
-    if (work) { try { fs.rmSync(work, { recursive:true, force:true }); } catch(e){} }
+    const msg = String(err && err.message || err);
+    const code = /envie clipes|roteiro sem hook|nenhum clipe/.test(msg) ? 400 : 500;
+    res.status(code).json({ ok:false, error: msg });
   }
+});
+
+app.get('/render-video-reel/status/:id', (req, res) => {
+  if (TOKEN && req.get('x-api-token') !== TOKEN) return res.status(401).json({ ok:false, error:'token inválido' });
+  const j = RV_JOBS.get(req.params.id);
+  if (!j) return res.status(404).json({ ok:false, status:'desconhecido', error:'job não encontrado (o serviço pode ter reiniciado; peça o render de novo)' });
+  res.json({ ok:true, status:j.status, error:j.error || null, duration:j.duration || null, avisos:j.avisos || [] });
+});
+
+app.get('/render-video-reel/result/:id', (req, res) => {
+  if (TOKEN && req.get('x-api-token') !== TOKEN) return res.status(401).json({ ok:false, error:'token inválido' });
+  const j = RV_JOBS.get(req.params.id);
+  if (!j || j.status !== 'done' || !j.file) return res.status(404).json({ ok:false, error:'resultado indisponível' });
+  let mp4;
+  try { mp4 = fs.readFileSync(j.file); } catch(e){ return res.status(404).json({ ok:false, error:'arquivo do job não existe mais' }); }
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', 'inline; filename="reel_video.mp4"');
+  res.send(mp4);
+  try { fs.rmSync(j.work, { recursive:true, force:true }); } catch(e){}
+  RV_JOBS.delete(req.params.id);
 });
 
 // ─── PDF da Edição (v1, intacto) ─────────────────────────────────────
