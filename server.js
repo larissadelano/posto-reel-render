@@ -46,6 +46,15 @@ async function getBrowser(){
   return browser;
 }
 
+// Fecha o Chromium e devolve TODA a memoria acumulada (paginas/leaks de
+// dezenas de screenshots). Chamado antes e depois do trabalho pesado do
+// reel-video: e o que evita o estouro dos 512 MB do plano do Render.
+async function reciclarBrowser(){
+  try { if (browser) await browser.close(); } catch(e){}
+  browser = null;
+  if (global.gc) { try { global.gc(); } catch(e){} }
+}
+
 // baixa cada mídia e embute como data URI (reel de fotos)
 async function midiaDataURI(url){
   try {
@@ -190,9 +199,17 @@ app.post('/render-video-reel', async (req, res) => {
   if (req.query.mode === 'async'){
     const job_id = 'rv-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
     RV_JOBS.set(job_id, { status:'processing', criado: Date.now() });
-    executarReelVideo(body)
-      .then(r => RV_JOBS.set(job_id, { status:'done', file:r.out, work:r.work, duration:r.duration, avisos:r.avisos, criado: Date.now() }))
-      .catch(e => RV_JOBS.set(job_id, { status:'error', error:String(e && e.message || e), criado: Date.now() }));
+    (async () => {
+      await reciclarBrowser();                       // comeca o video com Chromium limpo
+      try {
+        const r = await executarReelVideo(body);
+        RV_JOBS.set(job_id, { status:'done', file:r.out, work:r.work, duration:r.duration, avisos:r.avisos, criado: Date.now() });
+      } catch (e) {
+        RV_JOBS.set(job_id, { status:'error', error:String(e && e.message || e), criado: Date.now() });
+      } finally {
+        await reciclarBrowser();                     // libera a memoria ao terminar
+      }
+    })();
     return res.json({ ok:true, job_id });
   }
 
